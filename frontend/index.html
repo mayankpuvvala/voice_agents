@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Receptionist</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot" id="conn-dot"></span>
+    <strong id="business-name">AI Receptionist</strong>
+  </div>
+  <nav>
+    <a href="/admin">Dashboard</a>
+  </nav>
+</header>
+
+<main class="call-layout">
+  <section class="stage">
+    <div class="orb" id="orb" data-state="idle">
+      <span class="orb-ring"></span>
+      <span class="orb-core"></span>
+    </div>
+    <p class="stage-status" id="status">Ready to take a call</p>
+    <div class="level"><span id="level-bar"></span></div>
+
+    <div class="controls">
+      <button id="start" class="btn primary">Start call</button>
+      <button id="hangup" class="btn danger" disabled>Hang up</button>
+      <button id="ptt" class="btn ghost" disabled title="Hold to talk if auto-detection misfires">Hold to talk</button>
+      <button id="mute-tts" class="btn ghost" disabled>Mute voice</button>
+    </div>
+
+    <form id="type-form" class="type-row" autocomplete="off">
+      <input id="type-input" type="text" placeholder="…or type instead of speaking" disabled />
+      <button class="btn ghost" type="submit" disabled id="type-send">Send</button>
+    </form>
+
+    <p class="hint">
+      Speak normally — the line listens, waits for you to finish, then replies out loud.
+      Use headphones to stop the reply being picked up as new speech.
+    </p>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Transcript</h2>
+      <span class="badge" id="call-badge">—</span>
+    </div>
+    <div class="transcript" id="transcript"></div>
+
+    <div class="panel-head">
+      <h2>Activity</h2>
+    </div>
+    <div class="activity" id="activity">
+      <p class="muted">Knowledge lookups, availability checks and bookings appear here.</p>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

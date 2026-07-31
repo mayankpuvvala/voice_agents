@@ -1,0 +1,16 @@
+# Web server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.9
+python-dotenv>=1.0.1
+
+# LLM
+openai>=1.55.0
+
+# Speech-to-text (local, CPU). Pulls ctranslate2 + PyAV — no PyTorch needed.
+faster-whisper>=1.1.0
+
+# Retrieval
+scikit-learn>=1.5.0
+numpy>=1.26.0
+pypdf>=5.1.0

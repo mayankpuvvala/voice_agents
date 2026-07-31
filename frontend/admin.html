@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Dashboard — AI Receptionist</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><strong id="business-name">Dashboard</strong></div>
+  <nav>
+    <a href="/">Call console</a>
+    <a href="#" id="refresh">Refresh</a>
+  </nav>
+</header>
+
+<main class="admin-layout">
+  <div class="tabs">
+    <button class="tab active" data-view="calls">Calls</button>
+    <button class="tab" data-view="appointments">Appointments</button>
+    <button class="tab" data-view="notes">Notes</button>
+    <button class="tab" data-view="knowledge">Knowledge base</button>
+  </div>
+
+  <div class="panel">
+    <div id="view"></div>
+  </div>
+</main>
+
+<dialog id="call-dialog">
+  <div id="call-detail"></div>
+  <p style="margin-top:18px"><button class="btn ghost" id="close-dialog">Close</button></p>
+</dialog>
+
+<script src="/static/admin.js"></script>
+</body>
+</html>
