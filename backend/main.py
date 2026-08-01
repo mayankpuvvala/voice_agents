@@ -6,13 +6,15 @@ import asyncio
 import contextlib
 import logging
 import os
-from typing import Any
+import secrets
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
-from . import agent, db, stt
+from . import agent, db, stt, tts
 from .config import settings
 from .rag import SUPPORTED_SUFFIXES, retriever
 
@@ -20,6 +22,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(m
 log = logging.getLogger("receptionist")
 
 app = FastAPI(title="AI Receptionist")
+
+_basic_auth = HTTPBasic(auto_error=False)
+
+
+def require_admin(
+    credentials: Annotated[HTTPBasicCredentials | None, Depends(_basic_auth)] = None,
+) -> None:
+    """Gate the admin dashboard and API behind HTTP Basic auth.
+
+    No-ops when ADMIN_USERNAME/ADMIN_PASSWORD aren't set, which is only
+    acceptable for local development on 127.0.0.1 — see the startup warning.
+    """
+    if not settings.auth_required:
+        return
+    valid = bool(credentials) and secrets.compare_digest(
+        credentials.username, settings.admin_username
+    ) and secrets.compare_digest(credentials.password, settings.admin_password)
+    if not valid:
+        raise HTTPException(
+            status_code=401,
+            detail="Admin credentials required.",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+
+AdminAuth = Depends(require_admin)
 
 
 @app.on_event("startup")
@@ -37,8 +65,16 @@ async def _startup() -> None:
             "No OPENAI_API_KEY in the environment. Set it in .env — otherwise every "
             "reply will fail with an auth error."
         )
+    if not settings.auth_required:
+        log.warning(
+            "ADMIN_USERNAME/ADMIN_PASSWORD not set — the admin dashboard and API are "
+            "wide open. Fine on 127.0.0.1, not once this is deployed publicly."
+        )
     log.info("Loading speech model '%s' (first run downloads it)...", settings.whisper_model)
     asyncio.create_task(asyncio.to_thread(stt.warm_up))
+    if settings.tts_enabled:
+        log.info("Loading Piper voices (first run downloads them)...")
+        asyncio.create_task(asyncio.to_thread(tts.warm_up))
 
 
 # ------------------------------------------------------------------ the call itself
@@ -80,7 +116,12 @@ async def call_socket(ws: WebSocket) -> None:
 
     greeting = settings.greeting
     session.record("assistant", greeting)
-    await ws.send_json({"type": "ready", "call_id": session.call_id, "greeting": greeting})
+    await ws.send_json({
+        "type": "ready",
+        "call_id": session.call_id,
+        "greeting": greeting,
+        "tts_enabled": settings.tts_enabled,
+    })
 
     try:
         while True:
@@ -167,18 +208,17 @@ async def api_config() -> dict[str, Any]:
         "receptionist_name": settings.receptionist_name,
         "greeting": settings.greeting,
         "model": settings.model,
-        "hours": settings.hours_label,
-        "open_days": settings.open_days_label,
+        "timezone": settings.timezone_label,
         "knowledge": retriever.stats,
     }
 
 
-@app.get("/api/calls")
+@app.get("/api/calls", dependencies=[AdminAuth])
 async def api_calls() -> list[dict[str, Any]]:
     return db.list_calls()
 
 
-@app.get("/api/calls/{call_id}")
+@app.get("/api/calls/{call_id}", dependencies=[AdminAuth])
 async def api_call(call_id: int) -> dict[str, Any]:
     call = db.get_call(call_id)
     if call is None:
@@ -186,33 +226,33 @@ async def api_call(call_id: int) -> dict[str, Any]:
     return call
 
 
-@app.get("/api/appointments")
-async def api_appointments() -> list[dict[str, Any]]:
-    return db.list_appointments()
+@app.get("/api/reservations", dependencies=[AdminAuth])
+async def api_reservations() -> list[dict[str, Any]]:
+    return db.list_reservations()
 
 
-@app.post("/api/appointments/{appointment_id}/cancel")
-async def api_cancel(appointment_id: int) -> dict[str, str]:
-    db.cancel_appointment(appointment_id)
+@app.post("/api/reservations/{reservation_id}/cancel", dependencies=[AdminAuth])
+async def api_cancel(reservation_id: int) -> dict[str, str]:
+    db.cancel_reservation(reservation_id)
     return {"status": "cancelled"}
 
 
-@app.get("/api/notes")
+@app.get("/api/notes", dependencies=[AdminAuth])
 async def api_notes() -> list[dict[str, Any]]:
     return db.list_notes()
 
 
-@app.get("/api/knowledge")
+@app.get("/api/knowledge", dependencies=[AdminAuth])
 async def api_knowledge() -> dict[str, Any]:
     return {"sources": retriever.sources(), **retriever.stats}
 
 
-@app.post("/api/knowledge/reindex")
+@app.post("/api/knowledge/reindex", dependencies=[AdminAuth])
 async def api_reindex() -> dict[str, Any]:
     return retriever.reindex()
 
 
-@app.post("/api/knowledge/upload")
+@app.post("/api/knowledge/upload", dependencies=[AdminAuth])
 async def api_upload(file: UploadFile) -> dict[str, Any]:
     name = os.path.basename(file.filename or "")
     if not name or name in {".", ".."}:
@@ -237,7 +277,7 @@ async def index() -> FileResponse:
     return FileResponse(settings.frontend_dir / "index.html")
 
 
-@app.get("/admin")
+@app.get("/admin", dependencies=[AdminAuth])
 async def admin() -> FileResponse:
     return FileResponse(settings.frontend_dir / "admin.html")
 

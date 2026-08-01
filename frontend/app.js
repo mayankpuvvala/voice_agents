@@ -3,7 +3,10 @@
  * Turn taking is done in the browser: an AnalyserNode watches the mic level,
  * MediaRecorder captures one utterance at a time, and the complete WebM blob is
  * pushed over the WebSocket when the caller stops speaking. Replies stream back
- * sentence by sentence and are spoken with the Web Speech API.
+ * sentence by sentence. Each "speech" event carries the text; when the server
+ * has Piper TTS enabled, an "audio" event with the synthesized WAV follows it
+ * and that's what actually plays. If the server has TTS turned off, the
+ * "ready" event says so and this falls back to the Web Speech API instead.
  */
 
 const $ = (id) => document.getElementById(id);
@@ -53,6 +56,9 @@ let utteranceStart = 0;
 let pushToTalk = false;
 let ttsMuted = false;
 let pendingSpeech = 0;
+let serverTtsEnabled = false;
+let audioQueue = [];
+let currentAudio = null;
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -147,8 +153,38 @@ function speak(text) {
   speechSynthesis.speak(u);
 }
 
+function playServerAudio(base64) {
+  audioQueue.push(base64);
+  if (!currentAudio) playNextServerAudio();
+}
+
+function playNextServerAudio() {
+  const b64 = audioQueue.shift();
+  if (!b64) {
+    currentAudio = null;
+    if (pendingSpeech === 0 && ws) resumeListening();
+    return;
+  }
+  pendingSpeech += 1;
+  setState("speaking", "Speaking…");
+  const audio = new Audio(`data:audio/wav;base64,${b64}`);
+  currentAudio = audio;
+  const done = () => {
+    pendingSpeech = Math.max(0, pendingSpeech - 1);
+    playNextServerAudio();
+  };
+  audio.onended = done;
+  audio.onerror = done;
+  audio.play().catch(done);
+}
+
 function stopSpeaking() {
   if ("speechSynthesis" in window) speechSynthesis.cancel();
+  audioQueue = [];
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio = null;
+  }
   pendingSpeech = 0;
 }
 
@@ -319,7 +355,10 @@ function handle(data) {
   switch (data.type) {
     case "ready":
       el.badge.textContent = `call #${data.call_id}`;
+      serverTtsEnabled = Boolean(data.tts_enabled);
       addTurn("assistant", data.greeting);
+      // The greeting is fixed text sent before any per-sentence server
+      // synthesis happens, so it always uses the browser's own voice.
       speak(data.greeting);
       break;
 
@@ -334,7 +373,14 @@ function handle(data) {
       break;
 
     case "speech":
-      speak(data.text);
+      // Only used as the spoken output when the server has no audio for this
+      // sentence (TTS off, or Piper failed) — the "audio" event otherwise
+      // arrives right after and is what actually plays.
+      if (!serverTtsEnabled) speak(data.text);
+      break;
+
+    case "audio":
+      if (!ttsMuted) playServerAudio(data.data);
       break;
 
     case "tool": {

@@ -1,12 +1,13 @@
-"""SQLite persistence for calls, transcripts, appointments and notes."""
+"""SQLite persistence for calls, transcripts, reservations and notes."""
 
 from __future__ import annotations
 
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Iterator
+from zoneinfo import ZoneInfo
 
 from .config import settings
 
@@ -29,17 +30,17 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS appointments (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    call_id          INTEGER REFERENCES calls(id) ON DELETE SET NULL,
-    name             TEXT NOT NULL,
-    phone            TEXT,
-    email            TEXT,
-    starts_at        TEXT NOT NULL,
-    duration_minutes INTEGER NOT NULL,
-    reason           TEXT,
-    status           TEXT NOT NULL DEFAULT 'booked',
-    created_at       TEXT NOT NULL
+-- No capacity/conflict checking on purpose: the owner manages the physical
+-- table, the bot just logs who asked for what and when.
+CREATE TABLE IF NOT EXISTS reservations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_id       INTEGER REFERENCES calls(id) ON DELETE SET NULL,
+    name          TEXT NOT NULL,
+    phone         TEXT,
+    guests_count  TEXT,
+    starts_at     TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'booked',
+    created_at    TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS notes (
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_call ON messages(call_id);
-CREATE INDEX IF NOT EXISTS idx_appointments_start ON appointments(starts_at);
+CREATE INDEX IF NOT EXISTS idx_reservations_start ON reservations(starts_at);
 """
 
 
@@ -73,7 +74,8 @@ def init_db() -> None:
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    """Wall-clock time in the restaurant's own timezone, not the server's."""
+    return datetime.now(ZoneInfo(settings.business_timezone)).isoformat(timespec="seconds")
 
 
 # --------------------------------------------------------------------------- calls
@@ -109,9 +111,9 @@ def list_calls(limit: int = 100) -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
             """SELECT c.*,
-                      (SELECT COUNT(*) FROM messages m WHERE m.call_id = c.id)     AS message_count,
-                      (SELECT COUNT(*) FROM appointments a WHERE a.call_id = c.id) AS appointment_count,
-                      (SELECT COUNT(*) FROM notes n WHERE n.call_id = c.id)        AS note_count
+                      (SELECT COUNT(*) FROM messages m WHERE m.call_id = c.id)      AS message_count,
+                      (SELECT COUNT(*) FROM reservations r WHERE r.call_id = c.id)  AS reservation_count,
+                      (SELECT COUNT(*) FROM notes n WHERE n.call_id = c.id)         AS note_count
                  FROM calls c
                 ORDER BY c.id DESC
                 LIMIT ?""",
@@ -129,8 +131,8 @@ def get_call(call_id: int) -> dict[str, Any] | None:
             "SELECT role, content, created_at FROM messages WHERE call_id = ? ORDER BY id",
             (call_id,),
         ).fetchall()
-        appts = conn.execute(
-            "SELECT * FROM appointments WHERE call_id = ? ORDER BY starts_at", (call_id,)
+        reservations = conn.execute(
+            "SELECT * FROM reservations WHERE call_id = ? ORDER BY starts_at", (call_id,)
         ).fetchall()
         notes = conn.execute(
             "SELECT * FROM notes WHERE call_id = ? ORDER BY id", (call_id,)
@@ -138,67 +140,39 @@ def get_call(call_id: int) -> dict[str, Any] | None:
     out = dict(call)
     out["follow_ups"] = json.loads(out["follow_ups"]) if out.get("follow_ups") else []
     out["messages"] = [dict(m) for m in messages]
-    out["appointments"] = [dict(a) for a in appts]
+    out["reservations"] = [dict(r) for r in reservations]
     out["notes"] = [dict(n) for n in notes]
     return out
 
 
-# -------------------------------------------------------------------- appointments
+# -------------------------------------------------------------------- reservations
 
 
-def find_conflict(starts_at: datetime, duration_minutes: int) -> dict[str, Any] | None:
-    """Return an existing booked appointment that overlaps the given window."""
-    ends_at = starts_at + timedelta(minutes=duration_minutes)
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM appointments WHERE status = 'booked'"
-        ).fetchall()
-    for row in rows:
-        try:
-            other_start = datetime.fromisoformat(row["starts_at"])
-        except ValueError:
-            continue
-        other_end = other_start + timedelta(minutes=row["duration_minutes"])
-        if starts_at < other_end and other_start < ends_at:
-            return dict(row)
-    return None
-
-
-def create_appointment(call_id: int | None, name: str, phone: str | None, email: str | None,
-                       starts_at: datetime, duration_minutes: int, reason: str | None) -> int:
+def create_reservation(call_id: int | None, name: str, phone: str | None,
+                        guests_count: str | None, starts_at: datetime) -> int:
     with connect() as conn:
         cur = conn.execute(
-            """INSERT INTO appointments
-                   (call_id, name, phone, email, starts_at, duration_minutes, reason, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (call_id, name, phone, email, starts_at.isoformat(timespec="minutes"),
-             duration_minutes, reason, _now()),
+            """INSERT INTO reservations
+                   (call_id, name, phone, guests_count, starts_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (call_id, name, phone, guests_count,
+             starts_at.isoformat(timespec="minutes"), _now()),
         )
         return int(cur.lastrowid)
 
 
-def booked_on(day: datetime) -> list[dict[str, Any]]:
-    prefix = day.strftime("%Y-%m-%d")
+def list_reservations(limit: int = 200) -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM appointments WHERE status = 'booked' AND starts_at LIKE ? ORDER BY starts_at",
-            (f"{prefix}%",),
+            "SELECT * FROM reservations ORDER BY starts_at DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
 
 
-def list_appointments(limit: int = 200) -> list[dict[str, Any]]:
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM appointments ORDER BY starts_at DESC LIMIT ?", (limit,)
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def cancel_appointment(appointment_id: int) -> None:
+def cancel_reservation(reservation_id: int) -> None:
     with connect() as conn:
         conn.execute(
-            "UPDATE appointments SET status = 'cancelled' WHERE id = ?", (appointment_id,)
+            "UPDATE reservations SET status = 'cancelled' WHERE id = ?", (reservation_id,)
         )
 
 

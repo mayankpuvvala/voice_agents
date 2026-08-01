@@ -1,14 +1,16 @@
-"""Tools the receptionist can call: knowledge lookup, availability, booking, notes."""
+"""Tools the receptionist can call: knowledge lookup, reservations, notes."""
 
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from . import db
 from .config import settings
 from .rag import retriever
+
 
 def _tool(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
     """Wrap a schema in the OpenAI chat-completions function-tool envelope."""
@@ -19,8 +21,8 @@ def _tool(name: str, description: str, parameters: dict[str, Any]) -> dict[str, 
 TOOLS: list[dict[str, Any]] = [
     _tool(
         "search_knowledge_base",
-        "Search the business's own documents (services, pricing, policies, hours, "
-        "directions, staff) for an answer. Call this whenever the caller asks "
+        "Search the business's own documents (menu, hours, delivery, pricing, "
+        "policies, directions) for an answer. Call this whenever the caller asks "
         "something factual about the business that you have not already been given "
         "in the conversation. Prefer this over answering from memory.",
         {
@@ -35,52 +37,33 @@ TOOLS: list[dict[str, Any]] = [
         },
     ),
     _tool(
-        "check_availability",
-        "List open appointment slots for a specific date. Call this before offering "
-        "the caller any time, so you never propose a slot that is already taken.",
+        "create_reservation",
+        "Log a table reservation. There is no capacity limit to check and no "
+        "conflict to reject — the owner manages the physical table, not you. "
+        "Only call this once you have a name, a guest count, and a requested "
+        "date/time. A phone number is not required for a reservation.",
         {
             "type": "object",
             "properties": {
-                "date": {
+                "name": {"type": "string", "description": "Name to hold the table under."},
+                "phone": {
                     "type": "string",
-                    "description": "The date to check, as YYYY-MM-DD.",
+                    "description": "Callback number, only if the caller offers one. Empty string otherwise.",
                 },
-                "duration_minutes": {
-                    "type": "integer",
-                    "description": f"Appointment length. Defaults to {settings.slot_minutes}.",
+                "guests_count": {"type": "string", "description": "Number of guests, e.g. '4'."},
+                "requested_time": {
+                    "type": "string",
+                    "description": "Requested date/time as YYYY-MM-DDTHH:MM (24-hour clock).",
                 },
             },
-            "required": ["date"],
-        },
-    ),
-    _tool(
-        "book_appointment",
-        "Book an appointment. Only call this once you have confirmed the caller's "
-        "name, a contact number, and a specific start time you verified with "
-        "check_availability.",
-        {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Caller's full name."},
-                "phone": {"type": "string", "description": "Callback phone number."},
-                "email": {"type": "string", "description": "Email address, if given."},
-                "starts_at": {
-                    "type": "string",
-                    "description": "Start time as YYYY-MM-DDTHH:MM (24-hour clock).",
-                },
-                "duration_minutes": {
-                    "type": "integer",
-                    "description": f"Length in minutes. Defaults to {settings.slot_minutes}.",
-                },
-                "reason": {"type": "string", "description": "Short reason for the visit."},
-            },
-            "required": ["name", "phone", "starts_at"],
+            "required": ["name", "guests_count", "requested_time"],
         },
     ),
     _tool(
         "save_note",
         "Record something the team needs to see after the call: a message to pass "
-        "on, a complaint, a callback request, or a detail worth keeping. Use it as "
+        "on, a complaint, a callback request, or a detail worth keeping — including "
+        "when a caller pushes back on something you've already declined. Use it as "
         "soon as the caller says something worth recording — do not wait until the "
         "end of the call.",
         {
@@ -118,39 +101,10 @@ def _parse_dt(value: str) -> datetime | None:
         return None
 
 
-def _within_hours(start: datetime, duration: int) -> str | None:
-    """Return an error message when the slot falls outside business hours."""
-    if start.weekday() not in settings.open_days:
-        return f"{start:%A} is not a working day. Open {settings.open_days_label}."
-    end = start + timedelta(minutes=duration)
-    open_at = start.replace(hour=settings.open_hour, minute=0, second=0, microsecond=0)
-    close_at = start.replace(hour=settings.close_hour, minute=0, second=0, microsecond=0)
-    if start < open_at or end > close_at:
-        return f"That is outside opening hours ({settings.hours_label})."
-    return None
-
-
-def free_slots(day: datetime, duration: int) -> list[str]:
-    if day.weekday() not in settings.open_days:
-        return []
-    booked = db.booked_on(day)
-    taken: list[tuple[datetime, datetime]] = []
-    for row in booked:
-        start = _parse_dt(row["starts_at"])
-        if start:
-            taken.append((start, start + timedelta(minutes=row["duration_minutes"])))
-
-    slots: list[str] = []
-    cursor = day.replace(hour=settings.open_hour, minute=0, second=0, microsecond=0)
-    close_at = day.replace(hour=settings.close_hour, minute=0, second=0, microsecond=0)
-    now = datetime.now()
-    while cursor + timedelta(minutes=duration) <= close_at:
-        end = cursor + timedelta(minutes=duration)
-        overlaps = any(cursor < t_end and t_start < end for t_start, t_end in taken)
-        if not overlaps and cursor > now:
-            slots.append(cursor.strftime("%H:%M"))
-        cursor += timedelta(minutes=settings.slot_minutes)
-    return slots
+def _now_local() -> datetime:
+    """Naive local time in the restaurant's own timezone, to compare against
+    the naive YYYY-MM-DDTHH:MM times the model sends."""
+    return datetime.now(ZoneInfo(settings.business_timezone)).replace(tzinfo=None)
 
 
 # --------------------------------------------------------------------------- dispatch
@@ -176,68 +130,38 @@ def execute(name: str, tool_input: dict[str, Any], call_id: int | None) -> tuple
             return body, {"query": query, "hits": len(hits),
                           "sources": sorted({c.source for c, _ in hits})}
 
-        if name == "check_availability":
-            duration = int(tool_input.get("duration_minutes") or settings.slot_minutes)
-            day = _parse_dt(f"{tool_input.get('date', '')}T00:00")
-            if day is None:
-                return "Invalid date. Use YYYY-MM-DD.", {"error": "bad_date"}
-            slots = free_slots(day, duration)
-            if not slots:
-                return (
-                    f"No {duration}-minute slots free on {day:%A %d %B %Y}. "
-                    f"Open {settings.open_days_label}, {settings.hours_label}.",
-                    {"date": day.strftime("%Y-%m-%d"), "slots": []},
-                )
-            return (
-                f"Free {duration}-minute slots on {day:%A %d %B %Y}: " + ", ".join(slots),
-                {"date": day.strftime("%Y-%m-%d"), "slots": slots},
-            )
-
-        if name == "book_appointment":
-            start = _parse_dt(str(tool_input.get("starts_at", "")))
+        if name == "create_reservation":
+            start = _parse_dt(str(tool_input.get("requested_time", "")))
             if start is None:
-                return "Invalid start time. Use YYYY-MM-DDTHH:MM.", {"error": "bad_time"}
-            duration = int(tool_input.get("duration_minutes") or settings.slot_minutes)
+                return "Invalid time. Use YYYY-MM-DDTHH:MM.", {"error": "bad_time"}
 
-            if start < datetime.now():
-                return "That time is in the past — offer a future slot.", {"error": "past"}
-
-            hours_error = _within_hours(start, duration)
-            if hours_error:
-                return f"Not booked. {hours_error}", {"error": "hours", "detail": hours_error}
-
-            conflict = db.find_conflict(start, duration)
-            if conflict:
-                alternatives = free_slots(start, duration)[:4]
-                return (
-                    "Not booked — that slot is already taken. "
-                    + (f"Still free that day: {', '.join(alternatives)}."
-                       if alternatives else "Nothing else free that day."),
-                    {"error": "conflict", "alternatives": alternatives},
-                )
+            if start < _now_local():
+                return "That time is in the past — ask for a future date/time.", {"error": "past"}
 
             name_value = str(tool_input.get("name", "")).strip()
-            phone = str(tool_input.get("phone", "")).strip()
-            if not name_value or not phone:
-                return "Not booked — a name and phone number are required.", {"error": "missing"}
+            guests_count = str(tool_input.get("guests_count", "")).strip()
+            if not name_value or not guests_count:
+                return "Not logged — a name and guest count are required.", {"error": "missing"}
 
-            appt_id = db.create_appointment(
+            phone = str(tool_input.get("phone", "")).strip() or None
+
+            reservation_id = db.create_reservation(
                 call_id=call_id,
                 name=name_value,
                 phone=phone,
-                email=(tool_input.get("email") or None),
+                guests_count=guests_count,
                 starts_at=start,
-                duration_minutes=duration,
-                reason=(tool_input.get("reason") or None),
             )
             return (
-                f"Booked (#{appt_id}) for {name_value} on {start:%A %d %B} at {start:%H:%M}, "
-                f"{duration} minutes. Confirm this back to the caller.",
+                f"Reservation #{reservation_id} logged for {name_value}, "
+                f"{guests_count} guests, on {start:%A %d %B} at {start:%H:%M}. "
+                "Confirm this back to the caller and let them know the owner will "
+                "have the table ready.",
                 {
-                    "id": appt_id,
+                    "id": reservation_id,
                     "name": name_value,
+                    "guests_count": guests_count,
                     "starts_at": start.isoformat(timespec="minutes"),
-                    "duration_minutes": duration,
                 },
             )
 

@@ -1,4 +1,4 @@
-/* Dashboard: calls, appointments, notes and the knowledge base. */
+/* Dashboard: calls, reservations, notes and the knowledge base. */
 
 const view = document.getElementById("view");
 const dialog = document.getElementById("call-dialog");
@@ -40,7 +40,7 @@ async function renderCalls() {
           <td>${when(c.started_at)}</td>
           <td>${esc(c.caller_name || "—")}<br><span class="muted">${esc(c.caller_phone || "")}</span></td>
           <td>${esc(c.summary || (c.ended_at ? "—" : "in progress"))}</td>
-          <td>${c.appointment_count}</td>
+          <td>${c.reservation_count}</td>
           <td>${c.note_count}</td>
           <td><button class="btn ghost" data-call="${c.id}">Transcript</button></td>
         </tr>`
@@ -48,26 +48,24 @@ async function renderCalls() {
       .join("")}</tbody></table>`;
 }
 
-async function renderAppointments() {
-  const rows = await get("/api/appointments");
-  if (!rows.length) return empty("Nothing booked yet.");
+async function renderReservations() {
+  const rows = await get("/api/reservations");
+  if (!rows.length) return empty("Nothing reserved yet.");
   return `<table>
     <thead><tr>
-      <th>When</th><th>Name</th><th>Contact</th><th>Reason</th>
-      <th>Length</th><th>Status</th><th></th>
+      <th>When</th><th>Name</th><th>Guests</th><th>Contact</th><th>Status</th><th></th>
     </tr></thead>
     <tbody>${rows
       .map(
-        (a) => `<tr>
-          <td>${when(a.starts_at)}</td>
-          <td>${esc(a.name)}</td>
-          <td>${esc(a.phone || "—")}<br><span class="muted">${esc(a.email || "")}</span></td>
-          <td>${esc(a.reason || "—")}</td>
-          <td>${a.duration_minutes} min</td>
-          <td><span class="pill ${esc(a.status)}">${esc(a.status)}</span></td>
+        (r) => `<tr>
+          <td>${when(r.starts_at)}</td>
+          <td>${esc(r.name)}</td>
+          <td>${esc(r.guests_count || "—")}</td>
+          <td>${esc(r.phone || "—")}</td>
+          <td><span class="pill ${esc(r.status)}">${esc(r.status)}</span></td>
           <td>${
-            a.status === "booked"
-              ? `<button class="btn ghost" data-cancel="${a.id}">Cancel</button>`
+            r.status === "booked"
+              ? `<button class="btn ghost" data-cancel="${r.id}">Cancel</button>`
               : ""
           }</td>
         </tr>`
@@ -116,7 +114,7 @@ async function renderKnowledge() {
 
 const RENDERERS = {
   calls: renderCalls,
-  appointments: renderAppointments,
+  reservations: renderReservations,
   notes: renderNotes,
   knowledge: renderKnowledge,
 };
@@ -185,7 +183,7 @@ view.addEventListener("click", async (e) => {
   }
 
   if (target.dataset.cancel) {
-    await fetch(`/api/appointments/${target.dataset.cancel}/cancel`, { method: "POST" });
+    await fetch(`/api/reservations/${target.dataset.cancel}/cancel`, { method: "POST" });
     render();
     return;
   }
