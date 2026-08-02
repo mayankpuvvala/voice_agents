@@ -12,7 +12,7 @@ if (-not (Test-Path ".venv")) {
 
 if (-not (Test-Path ".env")) {
     Copy-Item ".env.example" ".env"
-    Write-Host "Created .env — add your OPENAI_API_KEY, then run this again." -ForegroundColor Yellow
+    Write-Host "Created .env - add your OPENAI_API_KEY, then run this again." -ForegroundColor Yellow
     exit 1
 }
 

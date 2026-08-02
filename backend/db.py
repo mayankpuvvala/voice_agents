@@ -13,13 +13,15 @@ from .config import settings
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_at    TEXT NOT NULL,
-    ended_at      TEXT,
-    caller_name   TEXT,
-    caller_phone  TEXT,
-    summary       TEXT,
-    follow_ups    TEXT
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at        TEXT NOT NULL,
+    ended_at          TEXT,
+    caller_name       TEXT,
+    caller_phone      TEXT,
+    summary           TEXT,
+    follow_ups        TEXT,
+    recording_path    TEXT,
+    recording_seconds REAL
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -68,9 +70,23 @@ def connect() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after a database already existed.
+
+    CREATE TABLE IF NOT EXISTS only helps on a fresh database — an existing
+    calls table from before recording support needs these added by hand.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(calls)")}
+    if "recording_path" not in existing:
+        conn.execute("ALTER TABLE calls ADD COLUMN recording_path TEXT")
+    if "recording_seconds" not in existing:
+        conn.execute("ALTER TABLE calls ADD COLUMN recording_seconds REAL")
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 def _now() -> str:
@@ -88,14 +104,18 @@ def start_call() -> int:
 
 
 def end_call(call_id: int, summary: str, caller_name: str | None,
-             caller_phone: str | None, follow_ups: list[str]) -> None:
+             caller_phone: str | None, follow_ups: list[str],
+             recording_path: str | None = None,
+             recording_seconds: float | None = None) -> None:
     with connect() as conn:
         conn.execute(
             """UPDATE calls
                   SET ended_at = ?, summary = ?, caller_name = ?,
-                      caller_phone = ?, follow_ups = ?
+                      caller_phone = ?, follow_ups = ?,
+                      recording_path = ?, recording_seconds = ?
                 WHERE id = ?""",
-            (_now(), summary, caller_name, caller_phone, json.dumps(follow_ups), call_id),
+            (_now(), summary, caller_name, caller_phone, json.dumps(follow_ups),
+             recording_path, recording_seconds, call_id),
         )
 
 

@@ -27,20 +27,13 @@
     <div class="level"><span id="level-bar"></span></div>
 
     <div class="controls">
-      <button id="start" class="btn primary">Start call</button>
-      <button id="hangup" class="btn danger" disabled>Hang up</button>
-      <button id="ptt" class="btn ghost" disabled title="Hold to talk if auto-detection misfires">Hold to talk</button>
-      <button id="mute-tts" class="btn ghost" disabled>Mute voice</button>
+      <button id="call-btn" class="btn primary">Start call</button>
     </div>
-
-    <form id="type-form" class="type-row" autocomplete="off">
-      <input id="type-input" type="text" placeholder="…or type instead of speaking" disabled />
-      <button class="btn ghost" type="submit" disabled id="type-send">Send</button>
-    </form>
 
     <p class="hint">
       Speak normally — the line listens, waits for you to finish, then replies out loud.
-      Use headphones to stop the reply being picked up as new speech.
+      You can talk over a reply to interrupt it. Use headphones for the most reliable
+      results either way.
     </p>
   </section>
 

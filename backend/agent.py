@@ -43,9 +43,7 @@ def get_client() -> AsyncOpenAI:
     if _client is None:
         if not os.environ.get("OPENAI_API_KEY"):
             raise MissingCredentials(AUTH_HINT)
-        # base_url is picked up from OPENAI_BASE_URL when set, so Azure and
-        # OpenAI-compatible gateways work without code changes.
-        _client = AsyncOpenAI()
+        _client = AsyncOpenAI(base_url=settings.base_url)
     return _client
 
 
@@ -81,10 +79,7 @@ You are speaking with a caller on the phone. Everything you say is read aloud, s
 for the ear, not the page.
 
 # Language
-Callers speak either English or Hindi. Answer in whichever language the caller is currently \
-using — read their last message and match it. If they switch language mid-call, switch with \
-them on your very next reply. Do not mix both languages in a single reply unless the caller \
-just did.
+Always answer in English, regardless of what language the caller uses.
 
 # How to speak
 - Short turns. One or two sentences unless the caller asked for detail.

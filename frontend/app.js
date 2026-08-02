@@ -15,27 +15,29 @@ const el = {
   orb: $("orb"),
   status: $("status"),
   level: $("level-bar"),
-  start: $("start"),
-  hangup: $("hangup"),
-  ptt: $("ptt"),
-  muteTts: $("mute-tts"),
+  call: $("call-btn"),
   transcript: $("transcript"),
   activity: $("activity"),
   badge: $("call-badge"),
   connDot: $("conn-dot"),
   business: $("business-name"),
-  typeForm: $("type-form"),
-  typeInput: $("type-input"),
-  typeSend: $("type-send"),
 };
 
 const VAD = {
-  frameMs: 60,
-  startFrames: 3,      // consecutive loud frames before we open the mic
-  silenceMs: 1100,     // quiet run that ends an utterance
-  minUtteranceMs: 350,
+  // Whatever this is set to, recording only starts *after* startFrames
+  // worth of confirmed speech — so every frame here is audio lost off the
+  // front of the utterance. Kept short (5ms) so that onset delay
+  // (startFrames * frameMs) stays low; the speech-band check below is what
+  // actually keeps noise from opening the mic, not a long confirm run.
+  frameMs: 5,            // 5ms per frame
+  startFrames: 4,        // ~120ms of confirmed speech before we open the mic
+  silenceMs: 1100,       // quiet run that ends an utterance
+  minUtteranceMs: 650,
   maxUtteranceMs: 25000,
-  floorFrames: 14,     // ~0.85s of calibration
+  floorFrames: 28,       // ~0.85s of initial calibration
+  noiseEmaAlpha: 0.015,  // how fast the ambient floor keeps tracking a changing room
+  speechBandMin: 0.42,   // min. fraction of energy in the 300-3400Hz voice band to open the mic
+  bargeInFrames: 20,     // longer confirm run while our own TTS may be bleeding into the mic
 };
 
 let ws = null;
@@ -48,13 +50,15 @@ let chunks = [];
 let state = "idle";              // idle | listening | recording | thinking | speaking
 let vadTimer = null;
 let frameBuffer = null;
+let freqData = null;
 let noiseSamples = [];
+let noiseFloor = 0.02;
 let threshold = 0.02;
 let loudRun = 0;
+let bargeInRun = 0;
 let quietSince = 0;
 let utteranceStart = 0;
-let pushToTalk = false;
-let ttsMuted = false;
+let inCall = false;
 let pendingSpeech = 0;
 let serverTtsEnabled = false;
 let audioQueue = [];
@@ -136,7 +140,7 @@ function pickVoice() {
 }
 
 function speak(text) {
-  if (ttsMuted || !("speechSynthesis" in window)) return;
+  if (!("speechSynthesis" in window)) return;
   const u = new SpeechSynthesisUtterance(text);
   const voice = pickVoice();
   if (voice) u.voice = voice;
@@ -146,7 +150,10 @@ function speak(text) {
   setState("speaking", "Speaking…");
   const done = () => {
     pendingSpeech = Math.max(0, pendingSpeech - 1);
-    if (pendingSpeech === 0 && ws) resumeListening();
+    // Cancelling speechSynthesis for a barge-in fires this asynchronously —
+    // by the time it lands we may already be recording the next utterance,
+    // and this must not stomp that state back to "listening".
+    if (pendingSpeech === 0 && ws && state === "speaking") resumeListening();
   };
   u.onend = done;
   u.onerror = done;
@@ -171,7 +178,10 @@ function playNextServerAudio() {
   currentAudio = audio;
   const done = () => {
     pendingSpeech = Math.max(0, pendingSpeech - 1);
-    playNextServerAudio();
+    // .pause() (used to cut audio short on barge-in) doesn't fire onended,
+    // so this only runs for a clip that actually finished or errored —
+    // still, only advance the queue if nothing has moved us on already.
+    if (state === "speaking") playNextServerAudio();
   };
   audio.onended = done;
   audio.onerror = done;
@@ -195,6 +205,15 @@ function resumeListening() {
   quietSince = 0;
 }
 
+function bargeIn() {
+  bargeInRun = 0;
+  stopSpeaking();
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "interrupt" }));
+  }
+  startRecording();
+}
+
 /* --------------------------------------------------------------- recording */
 
 function bestMimeType() {
@@ -214,8 +233,14 @@ function startRecording() {
   if (recorder && recorder.state === "recording") return;
   chunks = [];
   const mimeType = bestMimeType();
+  // Voice-tuned bitrate — browsers often default Opus lower than this for
+  // a generic recording, which can blur consonants the STT model then
+  // can't recover.
+  const opts = mimeType
+    ? { mimeType, audioBitsPerSecond: 64000 }
+    : { audioBitsPerSecond: 64000 };
   try {
-    recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    recorder = new MediaRecorder(stream, opts);
   } catch (err) {
     addEvent("Recorder error", String(err), "err");
     return;
@@ -245,6 +270,25 @@ function stopRecording() {
 
 /* ---------------------------------------------------------------- mic + VAD */
 
+function speechBandRatio() {
+  // Broadband noise (clicks, creaks, AC hum) can cross the RMS threshold
+  // just as easily as speech — that's what was feeding Whisper garbage
+  // audio it then hallucinated real-sounding replies for. Human speech
+  // concentrates energy in the ~300-3400Hz band, so require a meaningful
+  // share of it there before treating a loud frame as someone talking.
+  analyser.getByteFrequencyData(freqData);
+  const binHz = (audioCtx.sampleRate / 2) / freqData.length;
+  let total = 0;
+  let band = 0;
+  for (let i = 0; i < freqData.length; i += 1) {
+    const v = freqData[i];
+    total += v;
+    const hz = i * binHz;
+    if (hz >= 300 && hz <= 3400) band += v;
+  }
+  return total > 0 ? band / total : 0;
+}
+
 function vadFrame() {
   if (!analyser) return;
   analyser.getFloatTimeDomainData(frameBuffer);
@@ -258,20 +302,38 @@ function vadFrame() {
   if (noiseSamples.length < VAD.floorFrames) {
     noiseSamples.push(rms);
     if (noiseSamples.length === VAD.floorFrames) {
-      const floor = noiseSamples.reduce((a, b) => a + b, 0) / noiseSamples.length;
-      threshold = Math.max(0.014, floor * 2.6 + 0.006);
+      noiseFloor = noiseSamples.reduce((a, b) => a + b, 0) / noiseSamples.length;
+      threshold = Math.max(0.014, noiseFloor * 2.6 + 0.006);
       resumeListening();
     }
     return;
   }
 
-  if (pushToTalk) return;
-  if (state === "thinking" || state === "speaking") return;
-
   const loud = rms > threshold;
 
+  if (state === "thinking" || state === "speaking") {
+    // Barge-in: let the caller talk over a reply instead of waiting it out.
+    // While actually speaking, our own TTS can bleed into the mic even with
+    // echo cancellation on, so require a longer confirmed run than opening
+    // the mic fresh needs (headphones make this far more reliable — see the
+    // on-page hint).
+    const required = state === "speaking" ? VAD.bargeInFrames : VAD.startFrames;
+    const speechLike = loud && speechBandRatio() > VAD.speechBandMin;
+    bargeInRun = speechLike ? bargeInRun + 1 : 0;
+    if (bargeInRun >= required) bargeIn();
+    return;
+  }
+
   if (state === "listening") {
-    loudRun = loud ? loudRun + 1 : 0;
+    if (!loud) {
+      // Keep tracking the ambient floor so the threshold adapts to a
+      // room that gets noisier or quieter mid-call, not just at the start.
+      noiseFloor = noiseFloor * (1 - VAD.noiseEmaAlpha) + rms * VAD.noiseEmaAlpha;
+      threshold = Math.max(0.014, noiseFloor * 2.6 + 0.006);
+      loudRun = 0;
+      return;
+    }
+    loudRun = speechBandRatio() > VAD.speechBandMin ? loudRun + 1 : 0;
     if (loudRun >= VAD.startFrames) startRecording();
     return;
   }
@@ -304,6 +366,7 @@ async function openMic() {
   analyser.fftSize = 1024;
   analyser.smoothingTimeConstant = 0.4;
   frameBuffer = new Float32Array(analyser.fftSize);
+  freqData = new Uint8Array(analyser.frequencyBinCount);
   audioCtx.createMediaStreamSource(stream).connect(analyser);
   noiseSamples = [];
   vadTimer = setInterval(vadFrame, VAD.frameMs);
@@ -366,6 +429,7 @@ function handle(data) {
       if (data.stage === "transcribing") setState("thinking", "Transcribing…");
       else if (data.stage === "thinking") setState("thinking", "Thinking…");
       else if (data.note === "no_speech") resumeListening();
+      else if (data.note === "interrupted") addEvent("Interrupted", "Caller spoke over the reply", "warn");
       break;
 
     case "transcript":
@@ -380,7 +444,7 @@ function handle(data) {
       break;
 
     case "audio":
-      if (!ttsMuted) playServerAudio(data.data);
+      playServerAudio(data.data);
       break;
 
     case "tool": {
@@ -413,22 +477,25 @@ function handle(data) {
 /* ------------------------------------------------------------------ actions */
 
 async function startCall() {
-  el.start.disabled = true;
+  el.call.disabled = true;
+  el.call.textContent = "Connecting…";
   setState("thinking", "Requesting microphone…");
   try {
     await openMic();
   } catch (err) {
-    setState("idle", "Microphone blocked — you can still type below.");
+    setState("idle", "Microphone blocked — this app is audio-only, so a call needs it.");
     addEvent("Microphone", String(err && err.message ? err.message : err), "err");
-    el.start.disabled = false;
+    el.call.disabled = false;
+    el.call.textContent = "Start call";
+    return;
   }
   connect();
   setState("thinking", "Calibrating background noise…");
-  el.hangup.disabled = false;
-  el.ptt.disabled = !stream;
-  el.muteTts.disabled = false;
-  el.typeInput.disabled = false;
-  el.typeSend.disabled = false;
+  inCall = true;
+  el.call.textContent = "End call";
+  el.call.classList.remove("primary");
+  el.call.classList.add("danger");
+  el.call.disabled = false;
 }
 
 function endCall(notifyServer = true) {
@@ -439,49 +506,16 @@ function endCall(notifyServer = true) {
   closeMic();
   if (ws && notifyServer) setTimeout(() => ws && ws.close(), 400);
   setState("idle", "Call ended");
-  el.start.disabled = false;
-  el.hangup.disabled = true;
-  el.ptt.disabled = true;
-  el.muteTts.disabled = true;
-  el.typeInput.disabled = true;
-  el.typeSend.disabled = true;
+  inCall = false;
+  el.call.textContent = "Start call";
+  el.call.classList.remove("danger");
+  el.call.classList.add("primary");
+  el.call.disabled = false;
 }
 
-el.start.addEventListener("click", startCall);
-el.hangup.addEventListener("click", () => endCall(true));
-
-el.muteTts.addEventListener("click", () => {
-  ttsMuted = !ttsMuted;
-  el.muteTts.textContent = ttsMuted ? "Unmute voice" : "Mute voice";
-  el.muteTts.classList.toggle("active", ttsMuted);
-  if (ttsMuted) { stopSpeaking(); resumeListening(); }
-});
-
-el.ptt.addEventListener("pointerdown", () => {
-  if (!stream) return;
-  pushToTalk = true;
-  stopSpeaking();
-  el.ptt.classList.add("active");
-  startRecording();
-});
-
-const releasePtt = () => {
-  if (!pushToTalk) return;
-  pushToTalk = false;
-  el.ptt.classList.remove("active");
-  stopRecording();
-};
-el.ptt.addEventListener("pointerup", releasePtt);
-el.ptt.addEventListener("pointerleave", releasePtt);
-
-el.typeForm.addEventListener("submit", (e) => {
-  e.preventDefault();
-  const text = el.typeInput.value.trim();
-  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
-  el.typeInput.value = "";
-  stopSpeaking();
-  setState("thinking", "Thinking…");
-  ws.send(JSON.stringify({ type: "text", text }));
+el.call.addEventListener("click", () => {
+  if (inCall) endCall(true);
+  else startCall();
 });
 
 if ("speechSynthesis" in window) {

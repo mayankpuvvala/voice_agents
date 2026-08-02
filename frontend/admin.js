@@ -23,6 +23,22 @@ const when = (iso) => {
 
 const empty = (msg) => `<p class="empty">${esc(msg)}</p>`;
 
+const formatDuration = (seconds) => {
+  if (seconds == null || Number.isNaN(seconds)) return null;
+  const total = Math.round(seconds);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+};
+
+const callDuration = (c) => {
+  const fromRecording = formatDuration(c.recording_seconds);
+  if (fromRecording) return fromRecording;
+  if (!c.started_at || !c.ended_at) return "—";
+  const seconds = (new Date(c.ended_at) - new Date(c.started_at)) / 1000;
+  return formatDuration(seconds) || "—";
+};
+
 /* ------------------------------------------------------------------- views */
 
 async function renderCalls() {
@@ -30,7 +46,7 @@ async function renderCalls() {
   if (!calls.length) return empty("No calls yet. Open the call console and say hello.");
   return `<table>
     <thead><tr>
-      <th>#</th><th>Started</th><th>Caller</th><th>Summary</th>
+      <th>#</th><th>Started</th><th>Duration</th><th>Caller</th><th>Summary</th>
       <th>Booked</th><th>Notes</th><th></th>
     </tr></thead>
     <tbody>${calls
@@ -38,6 +54,7 @@ async function renderCalls() {
         (c) => `<tr>
           <td>${c.id}</td>
           <td>${when(c.started_at)}</td>
+          <td>${callDuration(c)}${c.recording_path ? " <span title=\"Recorded\">🎙</span>" : ""}</td>
           <td>${esc(c.caller_name || "—")}<br><span class="muted">${esc(c.caller_phone || "")}</span></td>
           <td>${esc(c.summary || (c.ended_at ? "—" : "in progress"))}</td>
           <td>${c.reservation_count}</td>
@@ -132,9 +149,26 @@ async function render() {
 
 async function openCall(id) {
   const call = await get(`/api/calls/${id}`);
+  const duration = callDuration(call);
   detail.innerHTML = `
     <h2 style="margin-top:0">Call #${call.id}</h2>
-    <p class="muted">${when(call.started_at)} → ${when(call.ended_at)}</p>
+    <p class="muted">
+      ${when(call.started_at)} → ${when(call.ended_at)}
+      ${duration !== "—" ? ` · ${duration}` : ""}
+      ${call.caller_name ? ` · ${esc(call.caller_name)}` : ""}
+      ${call.caller_phone ? ` · ${esc(call.caller_phone)}` : ""}
+    </p>
+    ${
+      call.recording_path
+        ? `<div style="margin:14px 0">
+            <audio controls preload="none" style="width:100%" src="/api/calls/${call.id}/recording"></audio>
+            <p class="muted" style="margin-top:6px">
+              ${formatDuration(call.recording_seconds) || duration} recorded ·
+              <a href="/api/calls/${call.id}/recording" download="call-${call.id}.wav">Download</a>
+            </p>
+          </div>`
+        : `<p class="muted">No recording for this call.</p>`
+    }
     ${call.summary ? `<p>${esc(call.summary)}</p>` : ""}
     ${
       call.follow_ups && call.follow_ups.length
@@ -143,7 +177,7 @@ async function openCall(id) {
             .join("")}</ul>`
         : ""
     }
-    <div class="transcript" style="max-height:46vh">
+    <div class="transcript" style="max-height:40vh">
       ${call.messages
         .map(
           (m) =>
