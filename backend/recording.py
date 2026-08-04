@@ -26,6 +26,19 @@ CHANNELS = 1
 SAMPLE_WIDTH = 2  # 16-bit PCM
 
 
+def _plane_bytes(frame: av.AudioFrame) -> bytes:
+    """The frame's actual PCM bytes, not PyAV's (larger, alignment-padded) plane buffer.
+
+    `bytes(frame.planes[0])` grabs the whole underlying buffer, which ffmpeg
+    allocates padded to an alignment boundary — the tail is uninitialized
+    garbage, not silence. Left in, it injects a burst of noise at every
+    single frame boundary (every ~20-85ms) throughout the recording, audible
+    as a constant ticking. Slicing to `frame.samples` is the fix.
+    """
+    valid_bytes = frame.samples * SAMPLE_WIDTH * CHANNELS
+    return bytes(frame.planes[0])[:valid_bytes]
+
+
 def _decode_to_pcm(data: bytes) -> bytes:
     """Decode any container PyAV understands to mono 16kHz 16-bit PCM bytes."""
     resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
@@ -34,9 +47,9 @@ def _decode_to_pcm(data: bytes) -> bytes:
         stream = container.streams.audio[0]
         for frame in container.decode(stream):
             for resampled in resampler.resample(frame):
-                pcm += bytes(resampled.planes[0])
+                pcm += _plane_bytes(resampled)
     for resampled in resampler.resample(None):  # flush
-        pcm += bytes(resampled.planes[0])
+        pcm += _plane_bytes(resampled)
     return bytes(pcm)
 
 
