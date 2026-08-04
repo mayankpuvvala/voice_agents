@@ -11,6 +11,9 @@ tzdata>=2024.1
 
 # LLM
 openai>=1.55.0
+# n8n reservation webhook (calendar sync). Already a transitive dependency
+# of openai/httpx-based packages, but imported directly so it's pinned here.
+httpx>=0.27.0
 
 # Speech-to-text fallback (local, CPU). Pulls ctranslate2 + PyAV — no PyTorch
 # needed. Primary STT is OpenAI's gpt-4o-mini-transcribe via the client above.

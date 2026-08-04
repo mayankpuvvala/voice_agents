@@ -14,8 +14,19 @@ We are on MG Road. There is a small parking lot behind the building.
 
 # Menu highlights
 
-Known for butter chicken, paneer tikka, garlic naan, and biryani. Full menu
-available in person or on our delivery listings.
+Known for butter chicken, paneer tikka, garlic naan, and biryani.
+
+Replace this with your actual menu and prices so the receptionist can answer
+menu questions directly instead of taking a message for them, e.g.:
+
+- Butter Chicken — Rs 320
+- Paneer Tikka — Rs 260
+- Garlic Naan — Rs 60
+- Chicken Biryani — Rs 340
+- Vegetable Biryani — Rs 280
+
+Vegetarian, vegan and spice-level options: [fill in]. Known allergens per
+dish: [fill in — never guess at allergen information].
 
 # Reservations
 
@@ -35,4 +46,4 @@ We accept cash, cards, and UPI.
 
 # Languages
 
-Our phone receptionist can take your call in English or Hindi.
+Our phone receptionist currently takes calls in English only.

@@ -105,6 +105,12 @@ class Settings:
     # be recorded.
     call_recording_enabled: bool = _bool("CALL_RECORDING_ENABLED", True)
 
+    # n8n webhook — notified on reservation create/update/cancel so it can
+    # sync a Google Calendar event and let Google email the caller an
+    # invite. Blank disables this entirely; every call site treats a failed
+    # or unconfigured webhook as non-fatal.
+    n8n_reservation_webhook_url: str = os.environ.get("N8N_RESERVATION_WEBHOOK_URL", "")
+
     # Business identity
     business_name: str = os.environ.get("BUSINESS_NAME", "Spice Route Kitchen")
     # Real IANA zone, used for every date/time computation (reservations,

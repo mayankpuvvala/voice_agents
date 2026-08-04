@@ -78,7 +78,10 @@ async function renderReservations() {
           <td>${when(r.starts_at)}</td>
           <td>${esc(r.name)}</td>
           <td>${esc(r.guests_count || "—")}</td>
-          <td>${esc(r.phone || "—")}</td>
+          <td>
+            ${esc(r.phone || "—")}
+            ${r.email ? `<br><span class="muted">${esc(r.email)}${r.calendar_event_id ? " · invited 📅" : ""}</span>` : ""}
+          </td>
           <td><span class="pill ${esc(r.status)}">${esc(r.status)}</span></td>
           <td>${
             r.status === "booked"

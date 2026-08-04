@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from . import db
+from . import db, n8n
 from .config import settings
 from .rag import retriever
 
@@ -41,7 +41,9 @@ TOOLS: list[dict[str, Any]] = [
         "Log a table reservation. There is no capacity limit to check and no "
         "conflict to reject — the owner manages the physical table, not you. "
         "Only call this once you have a name, a guest count, and a requested "
-        "date/time. A phone number is not required for a reservation.",
+        "date/time. A phone number is not required for a reservation. If the "
+        "caller wants a calendar invite emailed to them, also ask for their "
+        "email — this is optional, never block the reservation on it.",
         {
             "type": "object",
             "properties": {
@@ -50,6 +52,10 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Callback number, only if the caller offers one. Empty string otherwise.",
                 },
+                "email": {
+                    "type": "string",
+                    "description": "Email for a calendar invite, only if the caller offers one. Empty string otherwise.",
+                },
                 "guests_count": {"type": "string", "description": "Number of guests, e.g. '4'."},
                 "requested_time": {
                     "type": "string",
@@ -57,6 +63,58 @@ TOOLS: list[dict[str, Any]] = [
                 },
             },
             "required": ["name", "guests_count", "requested_time"],
+        },
+    ),
+    _tool(
+        "update_reservation",
+        "Change the guest count and/or time of a reservation that already exists "
+        "— found either earlier this call or via find_caller_history. Only the "
+        "fields the caller wants changed need to be given.",
+        {
+            "type": "object",
+            "properties": {
+                "reservation_id": {"type": "integer", "description": "The reservation's id."},
+                "guests_count": {
+                    "type": "string",
+                    "description": "New guest count, e.g. '4'. Empty string to leave unchanged.",
+                },
+                "requested_time": {
+                    "type": "string",
+                    "description": "New date/time as YYYY-MM-DDTHH:MM. Empty string to leave unchanged.",
+                },
+            },
+            "required": ["reservation_id"],
+        },
+    ),
+    _tool(
+        "cancel_reservation",
+        "Cancel a reservation that already exists — found either earlier this "
+        "call or via find_caller_history. Confirm which reservation with the "
+        "caller before cancelling if they have more than one upcoming.",
+        {
+            "type": "object",
+            "properties": {
+                "reservation_id": {"type": "integer", "description": "The reservation's id."},
+            },
+            "required": ["reservation_id"],
+        },
+    ),
+    _tool(
+        "find_caller_history",
+        "Look up this caller's past reservations and past call summaries by "
+        "name and/or phone number. Use this as soon as you have a name or "
+        "number, near the start of the call, so you can greet a returning "
+        "caller warmly and reference what they've contacted about before. "
+        "Also use it to find the reservation_id needed to update or cancel a "
+        "booking made in an earlier call. Returns nothing found for a new "
+        "caller — that's normal, just continue the call as usual.",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Caller's name, if given. Empty string otherwise."},
+                "phone": {"type": "string", "description": "Caller's phone number, if given. Empty string otherwise."},
+            },
+            "required": [],
         },
     ),
     _tool(
@@ -110,7 +168,7 @@ def _now_local() -> datetime:
 # --------------------------------------------------------------------------- dispatch
 
 
-def execute(name: str, tool_input: dict[str, Any], call_id: int | None) -> tuple[str, dict[str, Any]]:
+async def execute(name: str, tool_input: dict[str, Any], call_id: int | None) -> tuple[str, dict[str, Any]]:
     """Run a tool. Returns (result_text_for_the_model, event_payload_for_the_ui)."""
     try:
         if name == "search_knowledge_base":
@@ -144,19 +202,31 @@ def execute(name: str, tool_input: dict[str, Any], call_id: int | None) -> tuple
                 return "Not logged — a name and guest count are required.", {"error": "missing"}
 
             phone = str(tool_input.get("phone", "")).strip() or None
+            email = str(tool_input.get("email", "")).strip() or None
 
             reservation_id = db.create_reservation(
                 call_id=call_id,
                 name=name_value,
                 phone=phone,
+                email=email,
                 guests_count=guests_count,
                 starts_at=start,
             )
+
+            invite_note = ""
+            if email:
+                reservation = db.get_reservation(reservation_id)
+                result = await n8n.notify("created", reservation)
+                event_id = (result or {}).get("calendar_event_id")
+                if event_id:
+                    db.set_calendar_event_id(reservation_id, str(event_id))
+                    invite_note = " A calendar invite has been emailed to them."
+
             return (
                 f"Reservation #{reservation_id} logged for {name_value}, "
-                f"{guests_count} guests, on {start:%A %d %B} at {start:%H:%M}. "
-                "Confirm this back to the caller and let them know the owner will "
-                "have the table ready.",
+                f"{guests_count} guests, on {start:%A %d %B} at {start:%H:%M}."
+                f"{invite_note} Confirm this back to the caller and let them know "
+                "the owner will have the table ready.",
                 {
                     "id": reservation_id,
                     "name": name_value,
@@ -164,6 +234,79 @@ def execute(name: str, tool_input: dict[str, Any], call_id: int | None) -> tuple
                     "starts_at": start.isoformat(timespec="minutes"),
                 },
             )
+
+        if name == "update_reservation":
+            reservation_id = tool_input.get("reservation_id")
+            reservation = db.get_reservation(int(reservation_id)) if reservation_id else None
+            if reservation is None:
+                return "No reservation with that id.", {"error": "not_found"}
+            if reservation["status"] != "booked":
+                return "That reservation is already cancelled.", {"error": "cancelled"}
+
+            guests_count = str(tool_input.get("guests_count", "")).strip() or None
+            time_raw = str(tool_input.get("requested_time", "")).strip()
+            start = _parse_dt(time_raw) if time_raw else None
+            if time_raw and start is None:
+                return "Invalid time. Use YYYY-MM-DDTHH:MM.", {"error": "bad_time"}
+            if start and start < _now_local():
+                return "That time is in the past — ask for a future date/time.", {"error": "past"}
+
+            db.update_reservation(reservation["id"], guests_count=guests_count, starts_at=start)
+            updated = db.get_reservation(reservation["id"])
+            if updated.get("calendar_event_id"):
+                await n8n.notify("updated", updated)
+
+            return (
+                f"Reservation #{updated['id']} updated — now {updated['guests_count']} "
+                f"guests at {updated['starts_at'].replace('T', ' ')}. Confirm this back "
+                "to the caller.",
+                {"id": updated["id"], "guests_count": updated["guests_count"],
+                 "starts_at": updated["starts_at"]},
+            )
+
+        if name == "cancel_reservation":
+            reservation_id = tool_input.get("reservation_id")
+            reservation = db.get_reservation(int(reservation_id)) if reservation_id else None
+            if reservation is None:
+                return "No reservation with that id.", {"error": "not_found"}
+
+            db.cancel_reservation(reservation["id"])
+            if reservation.get("calendar_event_id"):
+                await n8n.notify("cancelled", reservation)
+
+            return (
+                f"Reservation #{reservation['id']} for {reservation['name']} cancelled. "
+                "Let the caller know it's taken care of.",
+                {"id": reservation["id"], "cancelled": True},
+            )
+
+        if name == "find_caller_history":
+            caller_name = str(tool_input.get("name", "")).strip() or None
+            caller_phone = str(tool_input.get("phone", "")).strip() or None
+            if not caller_name and not caller_phone:
+                return "Give a name or phone number to look up.", {"error": "missing"}
+
+            reservations = db.find_reservations(caller_name, caller_phone)
+            calls = db.find_recent_calls(caller_name, caller_phone)
+            if not reservations and not calls:
+                return "No past reservations or calls found for this caller — treat them as new.", {
+                    "reservations": 0, "calls": 0
+                }
+
+            lines = []
+            if reservations:
+                lines.append("Past/upcoming reservations:")
+                for r in reservations:
+                    lines.append(
+                        f"- #{r['id']}: {r['guests_count']} guests, "
+                        f"{r['starts_at'].replace('T', ' ')}, status={r['status']}"
+                    )
+            if calls:
+                lines.append("Past call summaries:")
+                for c in calls:
+                    lines.append(f"- {c['started_at']}: {c['summary']}")
+
+            return "\n".join(lines), {"reservations": len(reservations), "calls": len(calls)}
 
         if name == "save_note":
             content = str(tool_input.get("content", "")).strip()

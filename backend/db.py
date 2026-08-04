@@ -35,14 +35,16 @@ CREATE TABLE IF NOT EXISTS messages (
 -- No capacity/conflict checking on purpose: the owner manages the physical
 -- table, the bot just logs who asked for what and when.
 CREATE TABLE IF NOT EXISTS reservations (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    call_id       INTEGER REFERENCES calls(id) ON DELETE SET NULL,
-    name          TEXT NOT NULL,
-    phone         TEXT,
-    guests_count  TEXT,
-    starts_at     TEXT NOT NULL,
-    status        TEXT NOT NULL DEFAULT 'booked',
-    created_at    TEXT NOT NULL
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_id           INTEGER REFERENCES calls(id) ON DELETE SET NULL,
+    name              TEXT NOT NULL,
+    phone             TEXT,
+    email             TEXT,
+    guests_count      TEXT,
+    starts_at         TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'booked',
+    calendar_event_id TEXT,
+    created_at        TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS notes (
@@ -81,6 +83,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE calls ADD COLUMN recording_path TEXT")
     if "recording_seconds" not in existing:
         conn.execute("ALTER TABLE calls ADD COLUMN recording_seconds REAL")
+
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(reservations)")}
+    if "email" not in existing:
+        conn.execute("ALTER TABLE reservations ADD COLUMN email TEXT")
+    if "calendar_event_id" not in existing:
+        conn.execute("ALTER TABLE reservations ADD COLUMN calendar_event_id TEXT")
 
 
 def init_db() -> None:
@@ -169,13 +177,14 @@ def get_call(call_id: int) -> dict[str, Any] | None:
 
 
 def create_reservation(call_id: int | None, name: str, phone: str | None,
-                        guests_count: str | None, starts_at: datetime) -> int:
+                        guests_count: str | None, starts_at: datetime,
+                        email: str | None = None) -> int:
     with connect() as conn:
         cur = conn.execute(
             """INSERT INTO reservations
-                   (call_id, name, phone, guests_count, starts_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (call_id, name, phone, guests_count,
+                   (call_id, name, phone, email, guests_count, starts_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (call_id, name, phone, email, guests_count,
              starts_at.isoformat(timespec="minutes"), _now()),
         )
         return int(cur.lastrowid)
@@ -187,6 +196,89 @@ def list_reservations(limit: int = 200) -> list[dict[str, Any]]:
             "SELECT * FROM reservations ORDER BY starts_at DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_reservation(reservation_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def find_reservations(name: str | None = None, phone: str | None = None,
+                       limit: int = 5) -> list[dict[str, Any]]:
+    """Look up a caller's own reservations by name and/or phone, most recent
+    first — used both to act on a reservation from a past call (update/cancel)
+    and to recall it for a "welcome back" opening."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if name:
+        clauses.append("name LIKE ?")
+        params.append(f"%{name.strip()}%")
+    if phone:
+        clauses.append("phone = ?")
+        params.append(phone.strip())
+    if not clauses:
+        return []
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM reservations WHERE ({' OR '.join(clauses)}) "
+            "ORDER BY starts_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def find_recent_calls(name: str | None = None, phone: str | None = None,
+                       limit: int = 5) -> list[dict[str, Any]]:
+    """Past call summaries for the same caller — the other half of "past
+    interactions" alongside find_reservations."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if name:
+        clauses.append("caller_name LIKE ?")
+        params.append(f"%{name.strip()}%")
+    if phone:
+        clauses.append("caller_phone = ?")
+        params.append(phone.strip())
+    if not clauses:
+        return []
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT id, started_at, summary FROM calls WHERE ({' OR '.join(clauses)}) "
+            "AND summary IS NOT NULL AND summary != '' "
+            "ORDER BY started_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_reservation(reservation_id: int, guests_count: str | None = None,
+                        starts_at: datetime | None = None) -> None:
+    fields: list[str] = []
+    params: list[Any] = []
+    if guests_count is not None:
+        fields.append("guests_count = ?")
+        params.append(guests_count)
+    if starts_at is not None:
+        fields.append("starts_at = ?")
+        params.append(starts_at.isoformat(timespec="minutes"))
+    if not fields:
+        return
+    with connect() as conn:
+        conn.execute(
+            f"UPDATE reservations SET {', '.join(fields)} WHERE id = ?",
+            (*params, reservation_id),
+        )
+
+
+def set_calendar_event_id(reservation_id: int, calendar_event_id: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE reservations SET calendar_event_id = ? WHERE id = ?",
+            (calendar_event_id, reservation_id),
+        )
 
 
 def cancel_reservation(reservation_id: int) -> None:
