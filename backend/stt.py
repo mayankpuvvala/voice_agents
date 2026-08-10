@@ -42,15 +42,13 @@ _AVG_LOGPROB_MIN = -1.0
 # even without segment-level confidence to check (roughly under a second).
 _SHORT_AUDIO_BYTES = 12000
 
-# Whisper (and gpt-4o-mini-transcribe) switch to native script for Indian-
-# origin proper names — e.g. "Girish" comes back as "गीरीश" — even with
-# language forced to English. A style prompt nudges the model to keep
-# names transliterated in Latin letters instead.
 _NAME_PROMPT = (
     "Transcribe in English using Latin letters only. Names are often of "
     "Indian origin (e.g. Girish, Priya, Rohan) — spell them phonetically "
     "in English, never in Devanagari or other native script."
 )
+
+_PROMPT_LEAK_MARKERS = ("devanagari", "phonetically in english", "native script")
 
 # Known Whisper hallucinations — only treated as such when confidence (or,
 # for the OpenAI path, audio length) is also borderline, so a caller
@@ -109,6 +107,11 @@ def warm_up() -> None:
     _load_local()
 
 
+def _looks_like_prompt_leak(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _PROMPT_LEAK_MARKERS)
+
+
 def _looks_like_hallucination(text: str, no_speech_prob: float, avg_logprob: float) -> bool:
     normalized = text.strip().lower().strip(" .!?,")
     if normalized not in _HALLUCINATION_PHRASES:
@@ -128,6 +131,8 @@ def _join_segments(segments: list[tuple[str, float, float]]) -> str:
     worst_no_speech = max((n for _, n, _ in segments), default=0.0)
     worst_logprob = min((a for _, _, a in segments), default=0.0)
     if _looks_like_hallucination(text, worst_no_speech, worst_logprob):
+        return ""
+    if _looks_like_prompt_leak(text):
         return ""
     return text
 
@@ -178,12 +183,10 @@ async def _transcribe_openai(audio: bytes) -> str:
     buf = io.BytesIO(audio)
     buf.name = "utterance.webm"
     # gpt-4o-mini-transcribe only supports response_format="json" — no
-    # verbose_json/segments, unlike the Whisper-based paths above.
-    kwargs: dict[str, Any] = {
-        "model": settings.openai_stt_model,
-        "file": buf,
-        "prompt": _NAME_PROMPT,
-    }
+    # verbose_json/segments, unlike the Whisper-based paths above. No
+    # `prompt` here — see the _NAME_PROMPT comment on why this model in
+    # particular can echo it back instead of just using it as a style hint.
+    kwargs: dict[str, Any] = {"model": settings.openai_stt_model, "file": buf}
     if settings.stt_language:
         kwargs["language"] = settings.stt_language
     response = await client.audio.transcriptions.create(**kwargs)
@@ -192,6 +195,8 @@ async def _transcribe_openai(audio: bytes) -> str:
         return ""
     normalized = text.lower().strip(" .!?,")
     if normalized in _HALLUCINATION_PHRASES and len(audio) < _SHORT_AUDIO_BYTES:
+        return ""
+    if _looks_like_prompt_leak(text):
         return ""
     return text
 
