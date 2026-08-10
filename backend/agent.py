@@ -345,7 +345,7 @@ async def respond(
                 payload: dict[str, Any] = {"error": "bad_arguments"}
                 tool_input = {}
             else:
-                result_text, payload = toolkit.execute(call["name"], tool_input, call_id)
+                result_text, payload = await toolkit.execute(call["name"], tool_input, call_id)
 
             yield {"type": "tool", "name": call["name"], "input": tool_input, "result": payload}
             messages = messages + [

@@ -1,19 +1,12 @@
 """Speech-to-text: OpenAI gpt-4o-mini-transcribe (primary), Groq-hosted Whisper
-(fast/cheap fallback), then local faster-whisper (offline last resort).
+(fast/cheap fallback), then local faster-whisper (offline last resort). All
+three take the same WebM/Opus blob the browser sends per utterance.
 
-The browser sends one complete WebM/Opus blob per utterance, which all three
-paths can decode directly.
-
-Whisper models — which is what both Groq and the local fallback actually
-run — are notorious for hallucinating short, plausible-sounding phrases
-(video-caption sign-offs like "Thank you" or "Halo") when fed near-silent or
-noisy audio instead of returning nothing. Those two paths ask for
-segment-level confidence (no_speech_prob / avg_logprob) and drop segments
-that look like noise rather than speech, then run the survivors past a small
-blocklist of known hallucination phrases as a backstop. gpt-4o-mini-transcribe
-is a different (non-Whisper) architecture that's far less prone to this in
-the first place and doesn't expose the same segment metadata, so it gets a
-lighter, audio-length-based version of the same blocklist check instead.
+Whisper (Groq + local) hallucinates plausible-sounding phrases ("Thank you",
+"Halo") on near-silent/noisy audio instead of returning nothing, so those
+two paths drop low-confidence segments (no_speech_prob / avg_logprob) and
+blocklist-check what's left. gpt-4o-mini-transcribe doesn't expose that
+segment metadata, so it gets a lighter audio-length-based version instead.
 """
 
 from __future__ import annotations
@@ -36,12 +29,9 @@ _local_lock = threading.Lock()
 _groq_client: AsyncOpenAI | None = None
 _openai_stt_client: AsyncOpenAI | None = None
 
-# The openai SDK does `base_url = base_url or os.environ.get("OPENAI_BASE_URL")`
-# internally when base_url isn't passed — and os.environ.get returns "" (not
-# None) for a blank-but-set var, which the SDK then treats as a real
-# override instead of falling through to its own default. Pinning this
-# explicitly is the only way to keep this client on real OpenAI regardless
-# of whatever OPENAI_BASE_URL the chat model's client is using.
+# Pinned explicitly — a blank-but-set OPENAI_BASE_URL reads back as "" (not
+# None), which the openai SDK treats as a real override, so this must not
+# be left to inherit whatever base_url the chat client is using.
 _OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 # Segments this unconfident are almost always silence/noise, not speech.
@@ -51,6 +41,16 @@ _AVG_LOGPROB_MIN = -1.0
 # Below this many bytes of WebM/Opus, treat a blocklisted phrase as suspect
 # even without segment-level confidence to check (roughly under a second).
 _SHORT_AUDIO_BYTES = 12000
+
+# Whisper (and gpt-4o-mini-transcribe) switch to native script for Indian-
+# origin proper names — e.g. "Girish" comes back as "गीरीश" — even with
+# language forced to English. A style prompt nudges the model to keep
+# names transliterated in Latin letters instead.
+_NAME_PROMPT = (
+    "Transcribe in English using Latin letters only. Names are often of "
+    "Indian origin (e.g. Girish, Priya, Rohan) — spell them phonetically "
+    "in English, never in Devanagari or other native script."
+)
 
 # Known Whisper hallucinations — only treated as such when confidence (or,
 # for the OpenAI path, audio length) is also borderline, so a caller
@@ -141,6 +141,7 @@ def _transcribe_local_sync(audio: bytes) -> str:
         vad_parameters={"min_silence_duration_ms": 400},
         condition_on_previous_text=False,
         language=settings.stt_language or None,
+        initial_prompt=_NAME_PROMPT,
     )
     parsed = [(seg.text, seg.no_speech_prob, seg.avg_logprob) for seg in segments]
     return _join_segments(parsed)
@@ -156,6 +157,7 @@ async def _transcribe_groq(audio: bytes) -> str:
         "model": settings.groq_stt_model,
         "file": buf,
         "response_format": "verbose_json",
+        "prompt": _NAME_PROMPT,
     }
     if settings.stt_language:
         kwargs["language"] = settings.stt_language
@@ -177,7 +179,11 @@ async def _transcribe_openai(audio: bytes) -> str:
     buf.name = "utterance.webm"
     # gpt-4o-mini-transcribe only supports response_format="json" — no
     # verbose_json/segments, unlike the Whisper-based paths above.
-    kwargs: dict[str, Any] = {"model": settings.openai_stt_model, "file": buf}
+    kwargs: dict[str, Any] = {
+        "model": settings.openai_stt_model,
+        "file": buf,
+        "prompt": _NAME_PROMPT,
+    }
     if settings.stt_language:
         kwargs["language"] = settings.stt_language
     response = await client.audio.transcriptions.create(**kwargs)

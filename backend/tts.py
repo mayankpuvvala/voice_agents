@@ -36,10 +36,8 @@ _lock = threading.Lock()
 _openai_client = None
 _openai_lock = threading.Lock()
 
-# See the matching comment in stt.py: the openai SDK reads OPENAI_BASE_URL
-# from the environment whenever base_url isn't passed explicitly, and an
-# empty-but-set value leaks through as a real override. Pinning this here
-# keeps TTS on real OpenAI regardless of what the chat client's base_url is.
+# Pinned for the same reason as stt.py's _OPENAI_BASE_URL — keeps TTS on
+# real OpenAI regardless of the chat client's base_url.
 _OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 

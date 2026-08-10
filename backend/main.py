@@ -178,6 +178,12 @@ async def call_socket(ws: WebSocket) -> None:
         except asyncio.CancelledError:
             log.info("Call %s: turn interrupted by caller", session.call_id)
             raise
+        except Exception:
+            log.exception("Call %s: turn failed", session.call_id)
+            reply = "Sorry, something went wrong on my end — could you say that again?"
+            session.record("assistant", reply)
+            await send({"type": "transcript", "role": "assistant", "text": reply})
+            await send({"type": "turn_end"})
         finally:
             session.current_task = None
 
@@ -189,6 +195,22 @@ async def call_socket(ws: WebSocket) -> None:
         "greeting": greeting,
         "tts_enabled": settings.tts_enabled,
     })
+
+    if settings.tts_enabled:
+        try:
+            greeting_audio = await asyncio.to_thread(tts.synthesize, greeting)
+        except Exception:
+            log.exception(
+                "Call %s: TTS synthesis failed for the greeting — falling back "
+                "to the browser voice", session.call_id
+            )
+        else:
+            if session.recorder is not None:
+                session.recorder.add(greeting_audio)
+            await send({
+                "type": "audio",
+                "data": base64.b64encode(greeting_audio).decode("ascii"),
+            })
 
     try:
         while True:

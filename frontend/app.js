@@ -24,11 +24,6 @@ const el = {
 };
 
 const VAD = {
-  // Whatever this is set to, recording only starts *after* startFrames
-  // worth of confirmed speech — so every frame here is audio lost off the
-  // front of the utterance. Kept short (5ms) so that onset delay
-  // (startFrames * frameMs) stays low; the speech-band check below is what
-  // actually keeps noise from opening the mic, not a long confirm run.
   frameMs: 5,            // 5ms per frame
   startFrames: 4,        // ~120ms of confirmed speech before we open the mic
   silenceMs: 1100,       // quiet run that ends an utterance
@@ -420,9 +415,11 @@ function handle(data) {
       el.badge.textContent = `call #${data.call_id}`;
       serverTtsEnabled = Boolean(data.tts_enabled);
       addTurn("assistant", data.greeting);
-      // The greeting is fixed text sent before any per-sentence server
-      // synthesis happens, so it always uses the browser's own voice.
-      speak(data.greeting);
+      // Matches the "speech" case below: server audio (same voice as the
+      // rest of the call) arrives as a separate "audio" event right after
+      // when TTS is enabled. Only fall back to the browser's own voice
+      // when the server has none at all.
+      if (!serverTtsEnabled) speak(data.greeting);
       break;
 
     case "status":
