@@ -1,5 +1,8 @@
 # AI Receptionist — Spice Route Kitchen
 
+> **Mayank Puvvala** — browser voice agent demo (STT → LLM → TTS, tools, owner dashboard).  
+> Production telephony version: [voice_pipecat](https://github.com/mayankpuvvala/voice_pipecat) · Talk-to-me portfolio bot: [personal-voice-bot](https://mayankpuvvala.github.io/personal-voice-bot/)
+
 A browser-based voice receptionist for a restaurant. A caller speaks into
 their microphone; the app transcribes it, answers using OpenAI grounded in
 the restaurant's own facts, replies out loud in English or Hindi, logs
